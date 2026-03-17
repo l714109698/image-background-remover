@@ -1,87 +1,41 @@
 # Image Background Remover
 
-一个基于 Python FastAPI 和 rembg 的图像背景移除工具，提供 Vue 3 前端界面。
-
-## 功能特性
-
-- 🖼️ 自动移除图像背景
-- ⚡ 基于 AI 的高精度抠图
-- 🌐 RESTful API 接口
-- 🎨 简洁的 Vue 3 前端界面
-- 📦 支持批量处理
+基于 Cloudflare Pages + Workers 和 Remove.bg API 的图片去背景服务。
 
 ## 技术栈
 
-### 后端
-- **Python 3.9+**
-- **FastAPI** - 高性能 Web 框架
-- **rembg** - AI 背景移除库
-- **Pillow** - 图像处理
-- **uvicorn** - ASGI 服务器
+- 前端：HTML5 + TailwindCSS + Vanilla JS
+- 后端：Cloudflare Workers
+- API：Remove.bg
+- 部署：Cloudflare Pages（原生 GitHub 集成）
 
-### 前端
-- **Vue 3** - 渐进式 JavaScript 框架
-- **Vite** - 下一代前端构建工具
-- **Axios** - HTTP 客户端
-- **Tailwind CSS** - 实用优先的 CSS 框架
+## 特性
+
+- ✅ 纯内存处理，不存储用户图片
+- ✅ 拖拽上传 / 点击选择
+- ✅ 实时预览原图和去背结果
+- ✅ 下载透明 PNG 或更换背景色
+- ✅ 响应式设计，支持移动端
 
 ## 快速开始
 
-### 后端安装
+1. Fork 本项目到你的 GitHub
+2. 在 Cloudflare Dashboard 创建 Pages 项目，连接 GitHub 仓库
+3. 设置环境变量 `REMOVE_BG_API_KEY`
+4. 自动部署完成
 
-```bash
-cd backend
-pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
+## 环境变量
 
-### 前端安装
+| 变量名 | 说明 |
+|--------|------|
+| `REMOVE_BG_API_KEY` | Remove.bg API Key（https://www.remove.bg/api） |
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+## 合规声明
 
-## API 接口
+- 图片仅在内存中处理，请求结束后自动销毁
+- 请勿上传敏感、侵权或违规图片
+- 本服务仅供学习和个人使用
 
-### POST /api/remove-background
-移除图像背景
+## License
 
-**请求参数:**
-- `file`: 上传的图像文件 (PNG, JPG, JPEG, WEBP)
-
-**响应:**
-- 返回处理后的 PNG 图像（透明背景）
-
-**示例:**
-```bash
-curl -X POST "http://localhost:8000/api/remove-background" \
-  -F "file=@image.jpg" \
-  -o output.png
-```
-
-## 项目结构
-
-```
-image-background-remover/
-├── backend/
-│   ├── main.py          # FastAPI 应用入口
-│   ├── requirements.txt # Python 依赖
-│   └── ...
-├── frontend/
-│   ├── src/
-│   ├── package.json
-│   └── ...
-├── README.md
-├── .gitignore
-└── LICENSE
-```
-
-## 许可证
-
-MIT License
-
-## 作者
-
-Lovery Full-Stack Engineer
+MIT
