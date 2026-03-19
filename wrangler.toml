@@ -3,10 +3,4 @@ main = "worker.js"
 compatibility_date = "2024-01-01"
 
 [vars]
-# REMOVE_BG_API_KEY = "your_remove_bg_api_key_here"
-
-# For Cloudflare Pages integration:
-# 1. Go to Cloudflare Dashboard > Pages
-# 2. Connect your GitHub repository
-# 3. Go to Settings > Environment Variables
-# 4. Add REMOVE_BG_API_KEY as a production variable
+REMOVE_BG_API_KEY = "mrZiq9Zz8kAhjwAvXgMAxZVe"
