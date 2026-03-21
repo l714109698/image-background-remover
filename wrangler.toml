@@ -8,6 +8,11 @@ REMOVE_BG_API_KEY = "mrZiq9Zz8kAhjwAvXgMAxZVe"
 GOOGLE_CLIENT_ID = "1059929475260-2pmjcvqftrc57l4293l8f3nfpt5fbt6g.apps.googleusercontent.com"
 SITE_URL = "https://lovery-ai.com"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "image-bg-remover-db"
+database_id = "816f7b68-4536-4692-b4c1-1c4091c7a8f5"
+
 # ⚠️ 以下敏感变量通过 wrangler secret 设置，不提交到代码仓库：
 # GOOGLE_CLIENT_SECRET
 # JWT_SECRET

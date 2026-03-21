@@ -1,94 +1,122 @@
 /**
  * Cloudflare Worker - Image Background Remover
- * 带 Google OAuth 登录
- * 
- * 环境变量:
+ * Google OAuth + D1 用户体系 + 个人中心
+ *
+ * 环境变量 / 绑定:
  * - REMOVE_BG_API_KEY: Remove.bg API Key
- * - GOOGLE_CLIENT_ID: Google OAuth Client ID
- * - GOOGLE_CLIENT_SECRET: Google OAuth Client Secret
+ * - GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET: Google OAuth
  * - JWT_SECRET: JWT 签名密钥
- * - SITE_URL: 站点 URL (如 https://lovery-ai.com)
+ * - SITE_URL: 站点 URL
+ * - DB: D1 数据库绑定
  */
 
-// ==================== JWT 工具函数 ====================
+// ==================== JWT 工具 ====================
 
-function base64UrlEncode(str) {
+function b64UrlEncode(str) {
   return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-function base64UrlDecode(str) {
-  const base64 = str.replace(/-/g, '+').replace(/_/g, '/');
-  const padding = '='.repeat((4 - (base64.length % 4)) % 4);
-  const binary = atob(base64 + padding);
-  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+function b64UrlDecode(str) {
+  const b = str.replace(/-/g, '+').replace(/_/g, '/');
+  const p = '='.repeat((4 - (b.length % 4)) % 4);
+  const bin = atob(b + p);
+  return Uint8Array.from(bin, c => c.charCodeAt(0));
 }
 
 async function createJWT(payload, secret) {
-  const header = { alg: 'HS256', typ: 'JWT' };
-  const encodedHeader = base64UrlEncode(JSON.stringify(header));
-  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
-  const signingInput = `${encodedHeader}.${encodedPayload}`;
-
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-
-  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signingInput));
-  const encodedSignature = base64UrlEncode(String.fromCharCode(...new Uint8Array(signature)));
-
-  return `${signingInput}.${encodedSignature}`;
+  const h = b64UrlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const p = b64UrlEncode(JSON.stringify(payload));
+  const input = `${h}.${p}`;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(input));
+  return `${input}.${b64UrlEncode(String.fromCharCode(...new Uint8Array(sig)))}`;
 }
 
 async function verifyJWT(token, secret) {
   try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-
-    const [encodedHeader, encodedPayload, encodedSignature] = parts;
-    const signingInput = `${encodedHeader}.${encodedPayload}`;
-
-    const key = await crypto.subtle.importKey(
-      'raw',
-      new TextEncoder().encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['verify']
-    );
-
-    const signatureBytes = base64UrlDecode(encodedSignature);
-    const valid = await crypto.subtle.verify(
-      'HMAC',
-      key,
-      signatureBytes,
-      new TextEncoder().encode(signingInput)
-    );
-
+    const [h, p, s] = token.split('.');
+    if (!h || !p || !s) return null;
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+    const valid = await crypto.subtle.verify('HMAC', key, b64UrlDecode(s), new TextEncoder().encode(`${h}.${p}`));
     if (!valid) return null;
-
-    const payload = JSON.parse(atob(encodedPayload.replace(/-/g, '+').replace(/_/g, '/')));
+    const payload = JSON.parse(atob(p.replace(/-/g, '+').replace(/_/g, '/')));
     if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
-
     return payload;
-  } catch {
-    return null;
+  } catch { return null; }
+}
+
+function parseCookies(h) {
+  const c = {};
+  if (!h) return c;
+  h.split(';').forEach(s => { const [n, ...r] = s.trim().split('='); if (n) c[n.trim()] = r.join('=').trim(); });
+  return c;
+}
+
+// ==================== D1 用户操作 ====================
+
+const PLAN_LIMITS = { free: 5, pro: 50, premium: 999999 };
+
+async function getOrCreateUser(db, googleUser) {
+  // 查找已有用户
+  let user = await db.prepare('SELECT * FROM users WHERE google_id = ?').bind(googleUser.id).first();
+
+  if (!user) {
+    // 新建用户
+    await db.prepare(
+      'INSERT INTO users (google_id, email, name, avatar, plan, credits, credits_reset_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).bind(
+      googleUser.id, googleUser.email, googleUser.name, googleUser.picture,
+      'free', PLAN_LIMITS.free, new Date().toISOString().slice(0, 10)
+    ).run();
+    user = await db.prepare('SELECT * FROM users WHERE google_id = ?').bind(googleUser.id).first();
+  } else {
+    // 更新用户信息（头像、名字可能变）
+    await db.prepare(
+      'UPDATE users SET name = ?, avatar = ?, updated_at = datetime(\'now\') WHERE id = ?'
+    ).bind(googleUser.name, googleUser.picture, user.id).run();
   }
+
+  return user;
 }
 
-function parseCookies(cookieHeader) {
-  const cookies = {};
-  if (!cookieHeader) return cookies;
-  cookieHeader.split(';').forEach((cookie) => {
-    const [name, ...rest] = cookie.trim().split('=');
-    if (name) cookies[name.trim()] = rest.join('=').trim();
-  });
-  return cookies;
+async function resetCreditsIfNeeded(db, user) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (user.credits_reset_at !== today) {
+    const limit = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
+    await db.prepare(
+      'UPDATE users SET credits = ?, credits_reset_at = ?, updated_at = datetime(\'now\') WHERE id = ?'
+    ).bind(limit, today, user.id).run();
+    user.credits = limit;
+    user.credits_reset_at = today;
+  }
+  return user;
 }
 
-// ==================== Auth 路由处理 ====================
+async function consumeCredit(db, userId) {
+  const result = await db.prepare(
+    'UPDATE users SET credits = credits - 1, updated_at = datetime(\'now\') WHERE id = ? AND credits > 0'
+  ).bind(userId).run();
+  return result.meta.changes > 0;
+}
+
+async function logUsage(db, userId, action, fileName, fileSize, status) {
+  await db.prepare(
+    'INSERT INTO usage_logs (user_id, action, file_name, file_size, status) VALUES (?, ?, ?, ?, ?)'
+  ).bind(userId, action, fileName, fileSize, status).run();
+}
+
+async function getUserFromToken(request, env) {
+  const cookies = parseCookies(request.headers.get('Cookie'));
+  if (!cookies.auth_token) return null;
+  const payload = await verifyJWT(cookies.auth_token, env.JWT_SECRET);
+  if (!payload) return null;
+  let user = await env.DB.prepare('SELECT * FROM users WHERE google_id = ?').bind(payload.sub).first();
+  if (!user) return null;
+  user = await resetCreditsIfNeeded(env.DB, user);
+  return user;
+}
+
+// ==================== Auth 路由 ====================
 
 async function handleAuthLogin(env) {
   const state = crypto.randomUUID();
@@ -98,14 +126,12 @@ async function handleAuthLogin(env) {
     response_type: 'code',
     scope: 'openid email profile',
     access_type: 'offline',
-    state: state,
-    prompt: 'consent',
+    state, prompt: 'consent',
   });
-
   return new Response(null, {
     status: 302,
     headers: {
-      Location: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`,
+      Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}`,
       'Set-Cookie': `oauth_state=${state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`,
     },
   });
@@ -117,81 +143,59 @@ async function handleAuthCallback(request, env) {
   const state = url.searchParams.get('state');
   const error = url.searchParams.get('error');
 
-  if (error) {
-    return redirectWithError(env, 'Google 授权失败: ' + error);
-  }
-  if (!code) {
-    return redirectWithError(env, '缺少授权码');
-  }
+  if (error) return authRedirectError(env, 'Google 授权失败: ' + error);
+  if (!code) return authRedirectError(env, '缺少授权码');
 
-  // 验证 state
   const cookies = parseCookies(request.headers.get('Cookie'));
   if (!cookies.oauth_state || cookies.oauth_state !== state) {
-    return redirectWithError(env, '安全验证失败，请重新登录');
+    return authRedirectError(env, '安全验证失败，请重新登录');
   }
 
   try {
-    // 用 code 换 access_token
-    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+    // code → token
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
-        code,
-        client_id: env.GOOGLE_CLIENT_ID,
-        client_secret: env.GOOGLE_CLIENT_SECRET,
-        redirect_uri: env.SITE_URL + '/auth/callback',
-        grant_type: 'authorization_code',
+        code, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: env.SITE_URL + '/auth/callback', grant_type: 'authorization_code',
       }),
     });
+    if (!tokenRes.ok) { console.error('Token exchange failed:', await tokenRes.text()); return authRedirectError(env, '获取令牌失败'); }
+    const tokenData = await tokenRes.json();
 
-    if (!tokenResponse.ok) {
-      console.error('Token exchange failed:', await tokenResponse.text());
-      return redirectWithError(env, '获取令牌失败');
-    }
-
-    const tokenData = await tokenResponse.json();
-
-    // 获取用户信息
-    const userResponse = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+    // token → user info
+    const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
+    if (!userRes.ok) return authRedirectError(env, '获取用户信息失败');
+    const googleUser = await userRes.json();
 
-    if (!userResponse.ok) {
-      return redirectWithError(env, '获取用户信息失败');
-    }
+    // 创建/更新 D1 用户
+    const user = await getOrCreateUser(env.DB, googleUser);
 
-    const user = await userResponse.json();
+    // 签发 JWT（包含 DB user id）
+    const jwt = await createJWT({
+      sub: googleUser.id, uid: user.id, email: googleUser.email,
+      name: googleUser.name, picture: googleUser.picture,
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 7 * 24 * 3600,
+    }, env.JWT_SECRET);
 
-    // 签发 JWT
-    const jwt = await createJWT(
-      {
-        sub: user.id,
-        email: user.email,
-        name: user.name,
-        picture: user.picture,
-        iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 7 * 24 * 3600,
-      },
-      env.JWT_SECRET
-    );
-
-    // 设置多个 cookie 需要用多个 Set-Cookie 头
     const headers = new Headers();
     headers.set('Location', env.SITE_URL + '/');
     headers.append('Set-Cookie', `auth_token=${jwt}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${7 * 24 * 3600}`);
     headers.append('Set-Cookie', 'oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0');
-
     return new Response(null, { status: 302, headers });
   } catch (err) {
     console.error('OAuth callback error:', err);
-    return redirectWithError(env, '登录过程出错');
+    return authRedirectError(env, '登录过程出错');
   }
 }
 
-function redirectWithError(env, message) {
-  const params = new URLSearchParams({ error: message });
+function authRedirectError(env, message) {
   const headers = new Headers();
-  headers.set('Location', `${env.SITE_URL}/?${params.toString()}`);
+  headers.set('Location', `${env.SITE_URL}/?error=${encodeURIComponent(message)}`);
   headers.append('Set-Cookie', 'oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0');
   return new Response(null, { status: 302, headers });
 }
@@ -199,64 +203,109 @@ function redirectWithError(env, message) {
 function handleAuthLogout(env) {
   return new Response(null, {
     status: 302,
-    headers: {
-      Location: env.SITE_URL + '/',
-      'Set-Cookie': 'auth_token=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
-    },
+    headers: { Location: env.SITE_URL + '/', 'Set-Cookie': 'auth_token=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0' },
   });
 }
 
 async function handleAuthMe(request, env) {
-  const jsonHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+  const J = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+  const user = await getUserFromToken(request, env);
+  if (!user) return new Response(JSON.stringify({ authenticated: false }), { headers: J });
 
-  const cookies = parseCookies(request.headers.get('Cookie'));
-  const token = cookies.auth_token;
+  const todayLimit = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
+  const todayUsed = todayLimit - user.credits;
 
-  if (!token) {
-    return new Response(JSON.stringify({ authenticated: false }), { headers: jsonHeaders });
-  }
-
-  const payload = await verifyJWT(token, env.JWT_SECRET);
-  if (!payload) {
-    return new Response(JSON.stringify({ authenticated: false }), { headers: jsonHeaders });
-  }
-
-  return new Response(
-    JSON.stringify({
-      authenticated: true,
-      user: {
-        id: payload.sub,
-        email: payload.email,
-        name: payload.name,
-        picture: payload.picture,
-      },
-    }),
-    { headers: jsonHeaders }
-  );
+  return new Response(JSON.stringify({
+    authenticated: true,
+    user: {
+      id: user.id, email: user.email, name: user.name, picture: user.avatar,
+      plan: user.plan, credits: user.credits, todayUsed, todayLimit,
+      createdAt: user.created_at,
+    },
+  }), { headers: J });
 }
 
-// ==================== 鉴权中间件 ====================
+// ==================== API 路由 ====================
 
-async function requireAuth(request, env) {
-  const cookies = parseCookies(request.headers.get('Cookie'));
-  const token = cookies.auth_token;
+async function handleRemoveBg(request, env) {
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
+  const J = { ...cors, 'Content-Type': 'application/json' };
 
-  if (!token) {
-    return new Response(JSON.stringify({ error: '请先登录' }), {
-      status: 401,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-    });
+  // 鉴权
+  const user = await getUserFromToken(request, env);
+  if (!user) return new Response(JSON.stringify({ error: '请先登录' }), { status: 401, headers: J });
+
+  // 检查额度
+  if (user.credits <= 0) {
+    return new Response(JSON.stringify({ error: '今日免费额度已用完，请明天再试', credits: 0 }), { status: 403, headers: J });
   }
 
-  const payload = await verifyJWT(token, env.JWT_SECRET);
-  if (!payload) {
-    return new Response(JSON.stringify({ error: '登录已过期，请重新登录' }), {
-      status: 401,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-    });
-  }
+  try {
+    const formData = await request.formData();
+    const imageFile = formData.get('image_file');
+    if (!imageFile) return new Response(JSON.stringify({ error: 'No image file provided' }), { status: 400, headers: J });
+    if (!env.REMOVE_BG_API_KEY) return new Response(JSON.stringify({ error: 'API key not configured' }), { status: 500, headers: J });
 
-  return null; // 通过验证
+    const fileName = imageFile.name || 'unknown';
+    const fileSize = imageFile.size || 0;
+
+    // 扣减额度
+    const consumed = await consumeCredit(env.DB, user.id);
+    if (!consumed) {
+      return new Response(JSON.stringify({ error: '今日免费额度已用完' }), { status: 403, headers: J });
+    }
+
+    // 调用 Remove.bg
+    const bgFormData = new FormData();
+    bgFormData.append('image_file', imageFile);
+    bgFormData.append('size', 'auto');
+    const bgRes = await fetch('https://api.remove.bg/v1.0/removebg', {
+      method: 'POST', headers: { 'X-Api-Key': env.REMOVE_BG_API_KEY }, body: bgFormData,
+    });
+
+    if (!bgRes.ok) {
+      // 处理失败，回退额度
+      await env.DB.prepare('UPDATE users SET credits = credits + 1 WHERE id = ?').bind(user.id).run();
+      await logUsage(env.DB, user.id, 'remove_bg', fileName, fileSize, 'failed');
+      const errText = await bgRes.text();
+      console.error('Remove.bg error:', errText);
+      return new Response(JSON.stringify({ error: 'Failed to process image' }), { status: bgRes.status, headers: J });
+    }
+
+    // 成功，记录使用日志
+    await logUsage(env.DB, user.id, 'remove_bg', fileName, fileSize, 'success');
+
+    const img = await bgRes.arrayBuffer();
+    return new Response(img, {
+      headers: { ...cors, 'Content-Type': 'image/png', 'Content-Disposition': 'attachment; filename="background-removed.png"' },
+    });
+  } catch (err) {
+    console.error('Error:', err);
+    return new Response(JSON.stringify({ error: 'Internal server error' }), { status: 500, headers: J });
+  }
+}
+
+async function handleUsageLogs(request, env) {
+  const J = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+  const user = await getUserFromToken(request, env);
+  if (!user) return new Response(JSON.stringify({ error: '请先登录' }), { status: 401, headers: J });
+
+  const url = new URL(request.url);
+  const page = parseInt(url.searchParams.get('page') || '1');
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 50);
+  const offset = (page - 1) * limit;
+
+  const logs = await env.DB.prepare(
+    'SELECT id, action, file_name, file_size, status, created_at FROM usage_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?'
+  ).bind(user.id, limit, offset).all();
+
+  const total = await env.DB.prepare('SELECT COUNT(*) as count FROM usage_logs WHERE user_id = ?').bind(user.id).first();
+
+  return new Response(JSON.stringify({
+    logs: logs.results,
+    total: total.count,
+    page, limit,
+  }), { headers: J });
 }
 
 // ==================== HTML 页面 ====================
@@ -290,7 +339,6 @@ const indexHTML = `<!DOCTYPE html>
                         <p class="text-sm text-gray-500">智能图片去背景工具</p>
                     </div>
                 </div>
-                <!-- 登录区域 -->
                 <div id="authSection">
                     <div id="loginBtn" class="hidden">
                         <a href="/auth/login" class="flex items-center space-x-2 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-4 py-2.5 rounded-lg font-medium transition-colors shadow-sm">
@@ -299,10 +347,9 @@ const indexHTML = `<!DOCTYPE html>
                         </a>
                     </div>
                     <div id="userInfo" class="hidden flex items-center space-x-3">
-                        <img id="userAvatar" class="w-9 h-9 rounded-full border-2 border-blue-200" alt="avatar">
-                        <span id="userName" class="text-sm font-medium text-gray-700 hidden sm:inline"></span>
-                        <a href="/auth/logout" class="text-sm text-gray-500 hover:text-red-600 transition-colors ml-2" title="退出登录">
-                            <i class="fas fa-sign-out-alt"></i>
+                        <span id="creditsInfo" class="text-xs bg-blue-100 text-blue-700 px-2.5 py-1 rounded-full font-medium"></span>
+                        <a href="/profile" title="个人中心">
+                            <img id="userAvatar" class="w-9 h-9 rounded-full border-2 border-blue-200 hover:border-blue-400 transition-colors cursor-pointer" alt="avatar">
                         </a>
                     </div>
                 </div>
@@ -318,13 +365,8 @@ const indexHTML = `<!DOCTYPE html>
             <div id="uploadArea" class="upload-area border-2 border-dashed border-gray-300 rounded-xl p-12 text-center cursor-pointer transition-all">
                 <input type="file" id="fileInput" accept="image/*" class="hidden">
                 <div class="space-y-4">
-                    <div class="w-20 h-20 bg-blue-100 rounded-full flex items-center justify-center mx-auto">
-                        <i class="fas fa-cloud-upload-alt text-blue-600 text-3xl"></i>
-                    </div>
-                    <div>
-                        <p class="text-lg font-medium text-gray-900">拖拽图片到此处，或点击上传</p>
-                        <p class="text-sm text-gray-500 mt-1">图片仅在内存中处理，不会存储</p>
-                    </div>
+                    <div class="w-20 h-20 bg-blue-100 rounded-full flex items-center justify-center mx-auto"><i class="fas fa-cloud-upload-alt text-blue-600 text-3xl"></i></div>
+                    <div><p class="text-lg font-medium text-gray-900">拖拽图片到此处，或点击上传</p><p class="text-sm text-gray-500 mt-1">图片仅在内存中处理，不会存储</p></div>
                     <button class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-medium transition-colors">选择图片</button>
                 </div>
             </div>
@@ -335,9 +377,7 @@ const indexHTML = `<!DOCTYPE html>
                         <i class="fas fa-magic"></i><span>去除背景</span>
                     </button>
                 </div>
-                <div class="relative rounded-xl overflow-hidden shadow-lg checkerboard">
-                    <img id="previewImage" class="w-full max-h-96 object-contain" alt="Preview">
-                </div>
+                <div class="relative rounded-xl overflow-hidden shadow-lg checkerboard"><img id="previewImage" class="w-full max-h-96 object-contain" alt="Preview"></div>
             </div>
         </div>
         <div id="loadingSection" class="hidden bg-white rounded-2xl shadow-xl p-12 text-center">
@@ -348,49 +388,31 @@ const indexHTML = `<!DOCTYPE html>
         <div id="resultSection" class="hidden bg-white rounded-2xl shadow-xl p-8">
             <div class="flex items-center justify-between mb-6">
                 <h2 class="text-2xl font-bold text-gray-900">处理结果</h2>
-                <button id="startOverBtn" class="text-gray-600 hover:text-gray-900 flex items-center space-x-2">
-                    <i class="fas fa-redo"></i><span>重新开始</span>
-                </button>
+                <button id="startOverBtn" class="text-gray-600 hover:text-gray-900 flex items-center space-x-2"><i class="fas fa-redo"></i><span>重新开始</span></button>
             </div>
             <div class="grid md:grid-cols-2 gap-6 mb-8">
-                <div>
-                    <h3 class="text-lg font-semibold text-gray-900 mb-3 text-center">原图</h3>
-                    <div class="rounded-xl overflow-hidden shadow-lg checkerboard">
-                        <img id="originalImage" class="w-full h-64 object-contain bg-white" alt="Original">
-                    </div>
-                </div>
-                <div>
-                    <h3 class="text-lg font-semibold text-gray-900 mb-3 text-center">去背后</h3>
-                    <div class="rounded-xl overflow-hidden shadow-lg checkerboard">
-                        <img id="resultImage" class="w-full h-64 object-contain" alt="Result">
-                    </div>
-                </div>
+                <div><h3 class="text-lg font-semibold text-gray-900 mb-3 text-center">原图</h3><div class="rounded-xl overflow-hidden shadow-lg checkerboard"><img id="originalImage" class="w-full h-64 object-contain bg-white" alt="Original"></div></div>
+                <div><h3 class="text-lg font-semibold text-gray-900 mb-3 text-center">去背后</h3><div class="rounded-xl overflow-hidden shadow-lg checkerboard"><img id="resultImage" class="w-full h-64 object-contain" alt="Result"></div></div>
             </div>
             <div class="mb-6">
                 <h3 class="text-lg font-semibold text-gray-900 mb-3">更换背景色</h3>
                 <div class="flex flex-wrap gap-3">
                     <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300 checkerboard" data-color="transparent" title="透明"></button>
-                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color: #ffffff;" data-color="#ffffff" title="白色"></button>
-                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color: #000000;" data-color="#000000" title="黑色"></button>
-                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color: #ef4444;" data-color="#ef4444" title="红色"></button>
-                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color: #22c55e;" data-color="#22c55e" title="绿色"></button>
-                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color: #3b82f6;" data-color="#3b82f6" title="蓝色"></button>
-                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color: #fbbf24;" data-color="#fbbf24" title="黄色"></button>
+                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color:#fff" data-color="#ffffff" title="白色"></button>
+                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color:#000" data-color="#000000" title="黑色"></button>
+                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color:#ef4444" data-color="#ef4444" title="红色"></button>
+                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color:#22c55e" data-color="#22c55e" title="绿色"></button>
+                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color:#3b82f6" data-color="#3b82f6" title="蓝色"></button>
+                    <button class="bg-color-btn w-12 h-12 rounded-full border-2 border-gray-300" style="background-color:#fbbf24" data-color="#fbbf24" title="黄色"></button>
                 </div>
             </div>
             <div class="flex flex-wrap gap-4 justify-center">
-                <button id="downloadPngBtn" class="bg-green-600 hover:bg-green-700 text-white px-8 py-3 rounded-lg font-medium transition-colors flex items-center space-x-2">
-                    <i class="fas fa-download"></i><span>下载透明 PNG</span>
-                </button>
-                <button id="downloadWithBgBtn" class="bg-purple-600 hover:bg-purple-700 text-white px-8 py-3 rounded-lg font-medium transition-colors flex items-center space-x-2">
-                    <i class="fas fa-download"></i><span>下载带背景图</span>
-                </button>
+                <button id="downloadPngBtn" class="bg-green-600 hover:bg-green-700 text-white px-8 py-3 rounded-lg font-medium transition-colors flex items-center space-x-2"><i class="fas fa-download"></i><span>下载透明 PNG</span></button>
+                <button id="downloadWithBgBtn" class="bg-purple-600 hover:bg-purple-700 text-white px-8 py-3 rounded-lg font-medium transition-colors flex items-center space-x-2"><i class="fas fa-download"></i><span>下载带背景图</span></button>
             </div>
         </div>
         <div id="errorSection" class="hidden bg-red-50 border border-red-200 rounded-2xl p-6 text-center">
-            <div class="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                <i class="fas fa-exclamation-triangle text-red-600 text-2xl"></i>
-            </div>
+            <div class="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4"><i class="fas fa-exclamation-triangle text-red-600 text-2xl"></i></div>
             <h3 class="text-lg font-semibold text-red-900 mb-2">处理失败</h3>
             <p id="errorMessage" class="text-red-600 mb-4"></p>
             <button id="retryBtn" class="bg-red-600 hover:bg-red-700 text-white px-6 py-2.5 rounded-lg font-medium transition-colors">重试</button>
@@ -403,13 +425,10 @@ const indexHTML = `<!DOCTYPE html>
         </div>
     </footer>
     <script>
-        // ========== 登录状态管理 ==========
-        let isAuthenticated=false;
-        async function checkAuth(){try{const res=await fetch('/auth/me');const data=await res.json();if(data.authenticated){isAuthenticated=true;document.getElementById('loginBtn').classList.add('hidden');document.getElementById('userInfo').classList.remove('hidden');document.getElementById('userAvatar').src=data.user.picture||'';document.getElementById('userName').textContent=data.user.name||data.user.email}else{isAuthenticated=false;document.getElementById('loginBtn').classList.remove('hidden');document.getElementById('userInfo').classList.add('hidden')}}catch(e){isAuthenticated=false;document.getElementById('loginBtn').classList.remove('hidden');document.getElementById('userInfo').classList.add('hidden')}}
+        let isAuthenticated=false,currentUser=null;
+        async function checkAuth(){try{const r=await fetch('/auth/me');const d=await r.json();if(d.authenticated){isAuthenticated=true;currentUser=d.user;document.getElementById('loginBtn').classList.add('hidden');document.getElementById('userInfo').classList.remove('hidden');document.getElementById('userAvatar').src=d.user.picture||'';document.getElementById('creditsInfo').textContent='今日剩余 '+d.user.credits+'/'+d.user.todayLimit+' 次'}else{isAuthenticated=false;currentUser=null;document.getElementById('loginBtn').classList.remove('hidden');document.getElementById('userInfo').classList.add('hidden')}}catch(e){isAuthenticated=false;document.getElementById('loginBtn').classList.remove('hidden');document.getElementById('userInfo').classList.add('hidden')}}
         const urlParams=new URLSearchParams(window.location.search);if(urlParams.get('error')){alert('登录失败: '+urlParams.get('error'));window.history.replaceState({},'','/')}
         checkAuth();
-
-        // ========== DOM Elements ==========
         const uploadArea=document.getElementById('uploadArea'),fileInput=document.getElementById('fileInput'),previewSection=document.getElementById('previewSection'),previewImage=document.getElementById('previewImage'),removeBgBtn=document.getElementById('removeBgBtn'),loadingSection=document.getElementById('loadingSection'),resultSection=document.getElementById('resultSection'),originalImage=document.getElementById('originalImage'),resultImage=document.getElementById('resultImage'),errorSection=document.getElementById('errorSection'),errorMessage=document.getElementById('errorMessage'),retryBtn=document.getElementById('retryBtn'),startOverBtn=document.getElementById('startOverBtn'),downloadPngBtn=document.getElementById('downloadPngBtn'),downloadWithBgBtn=document.getElementById('downloadWithBgBtn'),bgColorBtns=document.querySelectorAll('.bg-color-btn');
         let currentFile=null,resultBlob=null,selectedBgColor='transparent';
         uploadArea.addEventListener('click',()=>fileInput.click());
@@ -417,15 +436,155 @@ const indexHTML = `<!DOCTYPE html>
         uploadArea.addEventListener('dragover',e=>{e.preventDefault();uploadArea.classList.add('dragover')});
         uploadArea.addEventListener('dragleave',()=>{uploadArea.classList.remove('dragover')});
         uploadArea.addEventListener('drop',e=>{e.preventDefault();uploadArea.classList.remove('dragover');if(e.dataTransfer.files.length>0)handleFile(e.dataTransfer.files[0])});
-        function handleFile(file){if(!file.type.startsWith('image/')){showError('请上传图片文件（JPG、PNG、WebP）');return}if(file.size>10*1024*1024){showError('图片大小不能超过 10MB');return}currentFile=file;const reader=new FileReader();reader.onload=e=>{previewImage.src=e.target.result;previewSection.classList.remove('hidden');uploadArea.classList.add('hidden')};reader.readAsDataURL(file)}
-        removeBgBtn.addEventListener('click',async()=>{if(!currentFile)return;if(!isAuthenticated){if(confirm('请先登录 Google 账号后使用此功能，是否前往登录？')){window.location.href='/auth/login'}return}previewSection.classList.add('hidden');loadingSection.classList.remove('hidden');errorSection.classList.add('hidden');try{const formData=new FormData();formData.append('image_file',currentFile);formData.append('size','auto');const response=await fetch('/api/remove-bg',{method:'POST',body:formData});if(!response.ok){if(response.status===401){isAuthenticated=false;checkAuth();throw new Error('登录已过期，请重新登录')}throw new Error('处理失败，请重试')}resultBlob=await response.blob();const resultUrl=URL.createObjectURL(resultBlob);originalImage.src=previewImage.src;resultImage.src=resultUrl;loadingSection.classList.add('hidden');resultSection.classList.remove('hidden')}catch(error){loadingSection.classList.add('hidden');showError(error.message||'处理失败，请检查网络连接')}});
-        bgColorBtns.forEach(btn=>{btn.addEventListener('click',()=>{bgColorBtns.forEach(b=>b.classList.remove('border-blue-600','border-4'));btn.classList.add('border-blue-600','border-4');selectedBgColor=btn.dataset.color;if(selectedBgColor==='transparent'){resultImage.style.background='transparent'}else{resultImage.style.background=selectedBgColor}})});
+        function handleFile(file){if(!file.type.startsWith('image/')){showError('请上传图片文件');return}if(file.size>10*1024*1024){showError('图片大小不能超过 10MB');return}currentFile=file;const reader=new FileReader();reader.onload=e=>{previewImage.src=e.target.result;previewSection.classList.remove('hidden');uploadArea.classList.add('hidden')};reader.readAsDataURL(file)}
+        removeBgBtn.addEventListener('click',async()=>{if(!currentFile)return;if(!isAuthenticated){if(confirm('请先登录 Google 账号后使用此功能，是否前往登录？')){window.location.href='/auth/login'}return}previewSection.classList.add('hidden');loadingSection.classList.remove('hidden');errorSection.classList.add('hidden');try{const fd=new FormData();fd.append('image_file',currentFile);fd.append('size','auto');const res=await fetch('/api/remove-bg',{method:'POST',body:fd});if(!res.ok){const err=await res.json().catch(()=>({error:'处理失败'}));if(res.status===401){isAuthenticated=false;checkAuth();throw new Error('登录已过期，请重新登录')}if(res.status===403){checkAuth();throw new Error(err.error||'额度已用完')}throw new Error(err.error||'处理失败，请重试')}resultBlob=await res.blob();originalImage.src=previewImage.src;resultImage.src=URL.createObjectURL(resultBlob);loadingSection.classList.add('hidden');resultSection.classList.remove('hidden');checkAuth()}catch(error){loadingSection.classList.add('hidden');showError(error.message||'处理失败')}});
+        bgColorBtns.forEach(btn=>{btn.addEventListener('click',()=>{bgColorBtns.forEach(b=>b.classList.remove('border-blue-600','border-4'));btn.classList.add('border-blue-600','border-4');selectedBgColor=btn.dataset.color;resultImage.style.background=selectedBgColor==='transparent'?'transparent':selectedBgColor})});
         bgColorBtns[0].click();
-        downloadPngBtn.addEventListener('click',()=>{if(!resultBlob)return;const url=URL.createObjectURL(resultBlob);const a=document.createElement('a');a.href=url;a.download='background-removed.png';a.click();URL.revokeObjectURL(url)});
-        downloadWithBgBtn.addEventListener('click',()=>{if(!resultBlob)return;const canvas=document.createElement('canvas');const ctx=canvas.getContext('2d');const img=new Image();img.onload=()=>{canvas.width=img.width;canvas.height=img.height;if(selectedBgColor!=='transparent'){ctx.fillStyle=selectedBgColor;ctx.fillRect(0,0,canvas.width,canvas.height)}ctx.drawImage(img,0,0);canvas.toBlob(blob=>{const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='image-with-background.png';a.click();URL.revokeObjectURL(url)},'image/png')};img.src=URL.createObjectURL(resultBlob)});
+        downloadPngBtn.addEventListener('click',()=>{if(!resultBlob)return;const u=URL.createObjectURL(resultBlob);const a=document.createElement('a');a.href=u;a.download='background-removed.png';a.click();URL.revokeObjectURL(u)});
+        downloadWithBgBtn.addEventListener('click',()=>{if(!resultBlob)return;const c=document.createElement('canvas'),ctx=c.getContext('2d'),img=new Image();img.onload=()=>{c.width=img.width;c.height=img.height;if(selectedBgColor!=='transparent'){ctx.fillStyle=selectedBgColor;ctx.fillRect(0,0,c.width,c.height)}ctx.drawImage(img,0,0);c.toBlob(b=>{const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='image-with-background.png';a.click();URL.revokeObjectURL(u)},'image/png')};img.src=URL.createObjectURL(resultBlob)});
         startOverBtn.addEventListener('click',()=>{resultSection.classList.add('hidden');uploadArea.classList.remove('hidden');previewSection.classList.add('hidden');fileInput.value='';currentFile=null;resultBlob=null;resultImage.style.background='transparent'});
         retryBtn.addEventListener('click',()=>{errorSection.classList.add('hidden');previewSection.classList.remove('hidden')});
-        function showError(message){errorMessage.textContent=message;errorSection.classList.remove('hidden')}
+        function showError(m){errorMessage.textContent=m;errorSection.classList.remove('hidden')}
+    <\/script>
+</body>
+</html>`;
+
+// ==================== 个人中心页面 ====================
+
+const profileHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>个人中心 - Image Background Remover</title>
+    <script src="https://cdn.tailwindcss.com"><\/script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
+    <header class="bg-white shadow-sm">
+        <div class="max-w-4xl mx-auto px-4 py-6">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-3">
+                    <a href="/" class="text-gray-500 hover:text-gray-700 transition-colors"><i class="fas fa-arrow-left text-lg"></i></a>
+                    <h1 class="text-2xl font-bold text-gray-900">个人中心</h1>
+                </div>
+                <a href="/" class="text-blue-600 hover:text-blue-700 font-medium flex items-center space-x-1"><i class="fas fa-home"></i><span>返回首页</span></a>
+            </div>
+        </div>
+    </header>
+    <main class="max-w-4xl mx-auto px-4 py-8">
+        <!-- 未登录提示 -->
+        <div id="notLoggedIn" class="hidden bg-white rounded-2xl shadow-xl p-12 text-center">
+            <div class="w-20 h-20 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4"><i class="fas fa-user-lock text-gray-400 text-3xl"></i></div>
+            <h2 class="text-xl font-bold text-gray-900 mb-2">请先登录</h2>
+            <p class="text-gray-500 mb-6">登录后即可查看个人中心</p>
+            <a href="/auth/login" class="inline-flex items-center space-x-2 bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-medium transition-colors">
+                <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+                <span>Google 登录</span>
+            </a>
+        </div>
+
+        <!-- 已登录内容 -->
+        <div id="profileContent" class="hidden space-y-6">
+            <!-- 用户信息卡片 -->
+            <div class="bg-white rounded-2xl shadow-xl p-8">
+                <div class="flex items-center space-x-6">
+                    <img id="pAvatar" class="w-20 h-20 rounded-full border-4 border-blue-200 shadow-lg" alt="avatar">
+                    <div class="flex-1">
+                        <h2 id="pName" class="text-2xl font-bold text-gray-900"></h2>
+                        <p id="pEmail" class="text-gray-500 mt-1"></p>
+                        <div class="flex items-center space-x-4 mt-3">
+                            <span id="pPlan" class="text-xs font-semibold px-3 py-1 rounded-full bg-blue-100 text-blue-700 uppercase"></span>
+                            <span id="pCreatedAt" class="text-xs text-gray-400"></span>
+                        </div>
+                    </div>
+                    <a href="/auth/logout" class="text-sm text-gray-400 hover:text-red-600 transition-colors flex items-center space-x-1 self-start"><i class="fas fa-sign-out-alt"></i><span>退出</span></a>
+                </div>
+            </div>
+
+            <!-- 使用额度 -->
+            <div class="bg-white rounded-2xl shadow-xl p-8">
+                <h3 class="text-lg font-bold text-gray-900 mb-4 flex items-center space-x-2"><i class="fas fa-chart-bar text-blue-600"></i><span>今日使用额度</span></h3>
+                <div class="flex items-center justify-between mb-3">
+                    <span class="text-gray-600">已使用 <span id="pUsed" class="font-bold text-gray-900"></span> / <span id="pTotal" class="font-bold text-gray-900"></span> 次</span>
+                    <span id="pPercent" class="text-sm font-medium text-blue-600"></span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-3">
+                    <div id="pBar" class="h-3 rounded-full transition-all duration-500" style="width:0%"></div>
+                </div>
+                <p class="text-sm text-gray-400 mt-3"><i class="fas fa-clock mr-1"></i>额度将于明日 00:00 (UTC) 自动重置</p>
+            </div>
+
+            <!-- 使用记录 -->
+            <div class="bg-white rounded-2xl shadow-xl p-8">
+                <h3 class="text-lg font-bold text-gray-900 mb-4 flex items-center space-x-2"><i class="fas fa-history text-blue-600"></i><span>使用记录</span></h3>
+                <div id="logsLoading" class="text-center py-8 text-gray-400"><div class="loading-spinner mx-auto mb-2" style="border:3px solid #e5e7eb;border-top:3px solid #3b82f6;border-radius:50%;width:30px;height:30px;animation:spin 1s linear infinite"></div>加载中...</div>
+                <div id="logsEmpty" class="hidden text-center py-8"><div class="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-3"><i class="fas fa-inbox text-gray-300 text-2xl"></i></div><p class="text-gray-400">暂无使用记录</p></div>
+                <div id="logsTable" class="hidden">
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead><tr class="border-b border-gray-200"><th class="text-left py-3 px-2 text-gray-500 font-medium">时间</th><th class="text-left py-3 px-2 text-gray-500 font-medium">文件名</th><th class="text-right py-3 px-2 text-gray-500 font-medium">大小</th><th class="text-center py-3 px-2 text-gray-500 font-medium">状态</th></tr></thead>
+                            <tbody id="logsBody"></tbody>
+                        </table>
+                    </div>
+                    <div id="logsPagination" class="flex justify-center items-center space-x-4 mt-4"></div>
+                </div>
+            </div>
+        </div>
+    </main>
+    <style>@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}.loading-spinner{display:inline-block}</style>
+    <script>
+        let currentPage=1;
+        async function loadProfile(){
+            try{
+                const r=await fetch('/auth/me');const d=await r.json();
+                if(!d.authenticated){document.getElementById('notLoggedIn').classList.remove('hidden');return}
+                document.getElementById('profileContent').classList.remove('hidden');
+                const u=d.user;
+                document.getElementById('pAvatar').src=u.picture||'';
+                document.getElementById('pName').textContent=u.name||'用户';
+                document.getElementById('pEmail').textContent=u.email;
+                document.getElementById('pPlan').textContent=u.plan==='free'?'🆓 Free':u.plan==='pro'?'⭐ Pro':'💎 Premium';
+                document.getElementById('pCreatedAt').textContent='注册于 '+new Date(u.createdAt).toLocaleDateString('zh-CN');
+                const used=u.todayUsed,total=u.todayLimit,pct=total>0?Math.round(used/total*100):0;
+                document.getElementById('pUsed').textContent=used;
+                document.getElementById('pTotal').textContent=total;
+                document.getElementById('pPercent').textContent=pct+'%';
+                const bar=document.getElementById('pBar');bar.style.width=pct+'%';
+                bar.className='h-3 rounded-full transition-all duration-500 '+(pct>=90?'bg-red-500':pct>=60?'bg-yellow-500':'bg-blue-500');
+                loadLogs(1);
+            }catch(e){document.getElementById('notLoggedIn').classList.remove('hidden')}
+        }
+        async function loadLogs(page){
+            currentPage=page;
+            document.getElementById('logsLoading').classList.remove('hidden');
+            document.getElementById('logsTable').classList.add('hidden');
+            document.getElementById('logsEmpty').classList.add('hidden');
+            try{
+                const r=await fetch('/api/usage?page='+page+'&limit=10');const d=await r.json();
+                document.getElementById('logsLoading').classList.add('hidden');
+                if(!d.logs||d.logs.length===0){document.getElementById('logsEmpty').classList.remove('hidden');return}
+                document.getElementById('logsTable').classList.remove('hidden');
+                const body=document.getElementById('logsBody');body.innerHTML='';
+                d.logs.forEach(l=>{
+                    const tr=document.createElement('tr');tr.className='border-b border-gray-100 hover:bg-gray-50';
+                    const t=new Date(l.created_at+'Z').toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+                    const sz=l.file_size?(l.file_size/1024).toFixed(1)+' KB':'—';
+                    const st=l.status==='success'?'<span class="text-green-600">✅ 成功</span>':'<span class="text-red-600">❌ 失败</span>';
+                    tr.innerHTML='<td class="py-3 px-2 text-gray-600">'+t+'</td><td class="py-3 px-2 text-gray-800 max-w-[200px] truncate">'+((l.file_name||'—'))+'</td><td class="py-3 px-2 text-gray-600 text-right">'+sz+'</td><td class="py-3 px-2 text-center">'+st+'</td>';
+                    body.appendChild(tr);
+                });
+                // 分页
+                const totalPages=Math.ceil(d.total/d.limit);
+                const pg=document.getElementById('logsPagination');pg.innerHTML='';
+                if(totalPages>1){
+                    if(page>1){const b=document.createElement('button');b.className='px-3 py-1 text-sm bg-gray-200 rounded hover:bg-gray-300';b.textContent='上一页';b.onclick=()=>loadLogs(page-1);pg.appendChild(b)}
+                    const s=document.createElement('span');s.className='text-sm text-gray-500';s.textContent=page+' / '+totalPages;pg.appendChild(s);
+                    if(page<totalPages){const b=document.createElement('button');b.className='px-3 py-1 text-sm bg-gray-200 rounded hover:bg-gray-300';b.textContent='下一页';b.onclick=()=>loadLogs(page+1);pg.appendChild(b)}
+                }
+            }catch(e){document.getElementById('logsLoading').classList.add('hidden');document.getElementById('logsEmpty').classList.remove('hidden')}
+        }
+        loadProfile();
     <\/script>
 </body>
 </html>`;
@@ -435,119 +594,28 @@ const indexHTML = `<!DOCTYPE html>
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
 
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    };
+    if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
 
-    // CORS preflight
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
-    }
+    // Auth
+    if (url.pathname === '/auth/login' && request.method === 'GET') return handleAuthLogin(env);
+    if (url.pathname === '/auth/callback' && request.method === 'GET') return handleAuthCallback(request, env);
+    if (url.pathname === '/auth/logout' && request.method === 'GET') return handleAuthLogout(env);
+    if (url.pathname === '/auth/me' && request.method === 'GET') return handleAuthMe(request, env);
 
-    // ===== Auth 路由 =====
-    if (url.pathname === '/auth/login' && request.method === 'GET') {
-      return handleAuthLogin(env);
-    }
+    // API
+    if (url.pathname === '/api/remove-bg' && request.method === 'POST') return handleRemoveBg(request, env);
+    if (url.pathname === '/api/usage' && request.method === 'GET') return handleUsageLogs(request, env);
 
-    if (url.pathname === '/auth/callback' && request.method === 'GET') {
-      return handleAuthCallback(request, env);
-    }
-
-    if (url.pathname === '/auth/logout' && request.method === 'GET') {
-      return handleAuthLogout(env);
-    }
-
-    if (url.pathname === '/auth/me' && request.method === 'GET') {
-      return handleAuthMe(request, env);
-    }
-
-    // ===== API 路由（需要登录） =====
-    if (url.pathname === '/api/remove-bg') {
-      if (request.method !== 'POST') {
-        return new Response('Method not allowed', { status: 405, headers: corsHeaders });
-      }
-
-      // 鉴权
-      const authError = await requireAuth(request, env);
-      if (authError) return authError;
-
-      try {
-        const formData = await request.formData();
-        const imageFile = formData.get('image_file');
-
-        if (!imageFile) {
-          return new Response(JSON.stringify({ error: 'No image file provided' }), {
-            status: 400,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          });
-        }
-
-        if (!env.REMOVE_BG_API_KEY) {
-          return new Response(JSON.stringify({ error: 'API key not configured' }), {
-            status: 500,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          });
-        }
-
-        const removeBgFormData = new FormData();
-        removeBgFormData.append('image_file', imageFile);
-        removeBgFormData.append('size', 'auto');
-
-        const removeBgResponse = await fetch('https://api.remove.bg/v1.0/removebg', {
-          method: 'POST',
-          headers: { 'X-Api-Key': env.REMOVE_BG_API_KEY },
-          body: removeBgFormData,
-        });
-
-        if (!removeBgResponse.ok) {
-          const errorData = await removeBgResponse.text();
-          console.error('Remove.bg API error:', errorData);
-
-          if (removeBgResponse.status === 403) {
-            return new Response(JSON.stringify({ error: 'Invalid API key' }), {
-              status: 403,
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-            });
-          }
-
-          return new Response(JSON.stringify({ error: 'Failed to process image', details: errorData }), {
-            status: removeBgResponse.status,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          });
-        }
-
-        const processedImage = await removeBgResponse.arrayBuffer();
-
-        return new Response(processedImage, {
-          headers: {
-            ...corsHeaders,
-            'Content-Type': 'image/png',
-            'Content-Disposition': 'attachment; filename="background-removed.png"',
-          },
-        });
-      } catch (error) {
-        console.error('Error processing image:', error);
-        return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
-          status: 500,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-      }
-    }
-
-    // ===== 首页 =====
+    // Pages
     if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-      return new Response(indexHTML, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
-      });
+      return new Response(indexHTML, { headers: { 'Content-Type': 'text/html; charset=utf-8', ...cors } });
+    }
+    if (request.method === 'GET' && url.pathname === '/profile') {
+      return new Response(profileHTML, { headers: { 'Content-Type': 'text/html; charset=utf-8', ...cors } });
     }
 
-    // 404
-    return new Response('Not Found', {
-      status: 404,
-      headers: { ...corsHeaders, 'Content-Type': 'text/plain' },
-    });
+    return new Response('Not Found', { status: 404, headers: { ...cors, 'Content-Type': 'text/plain' } });
   },
 };
