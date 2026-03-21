@@ -4,3 +4,9 @@ compatibility_date = "2024-01-01"
 
 [vars]
 REMOVE_BG_API_KEY = "mrZiq9Zz8kAhjwAvXgMAxZVe"
+GOOGLE_CLIENT_ID = "1059929475260-2pmjcvqftrc57l4293l8f3nfpt5fbt6g.apps.googleusercontent.com"
+SITE_URL = "https://lovery-ai.com"
+
+# ⚠️ 以下敏感变量请在 Cloudflare Dashboard 中设置，不要提交到代码仓库：
+# GOOGLE_CLIENT_SECRET = "在 Dashboard 中配置"
+# JWT_SECRET = "在 Dashboard 中配置"
