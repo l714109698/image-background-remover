@@ -16,3 +16,6 @@ database_id = "816f7b68-4536-4692-b4c1-1c4091c7a8f5"
 # ⚠️ 以下敏感变量通过 wrangler secret 设置，不提交到代码仓库：
 # GOOGLE_CLIENT_SECRET
 # JWT_SECRET
+# PAYPAL_CLIENT_ID
+# PAYPAL_CLIENT_SECRET
+# PAYPAL_API_URL (沙箱：https://api-m.sandbox.paypal.com)

@@ -1,6 +1,6 @@
 /**
  * Cloudflare Worker - Image Background Remover
- * Google OAuth + D1 用户体系 + 个人中心
+ * Google OAuth + D1 用户体系 + 个人中心 + PayPal 支付
  *
  * 环境变量 / 绑定:
  * - REMOVE_BG_API_KEY: Remove.bg API Key
@@ -8,7 +8,20 @@
  * - JWT_SECRET: JWT 签名密钥
  * - SITE_URL: 站点 URL
  * - DB: D1 数据库绑定
+ * - PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET: PayPal API (沙箱环境)
+ * - PAYPAL_API_URL: PayPal API 基础 URL (沙箱：https://api-m.sandbox.paypal.com)
  */
+
+// PayPal 配置
+const PAYPAL_CONFIG = {
+  clientId: '', // 从环境变量读取
+  clientSecret: '', // 从环境变量读取
+  apiUrl: 'https://api-m.sandbox.paypal.com', // 沙箱环境
+  plans: {
+    pro: { amount: '29.9', currency: 'CNY', name: 'Pro 专业版' },
+    premium: { amount: '59.9', currency: 'CNY', name: 'Premium 高级版' }
+  }
+};
 
 // ==================== JWT 工具 ====================
 
@@ -223,14 +236,302 @@ async function handleAuthMe(request, env) {
   const planLimit = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
   const used = planLimit - user.credits;
 
+  // 获取订阅信息
+  const subscription = await env.DB.prepare(
+    'SELECT * FROM subscriptions WHERE user_id = ? AND status = ?'
+  ).bind(user.id, 'ACTIVE').first();
+
   return new Response(JSON.stringify({
     authenticated: true,
     user: {
       id: user.id, email: user.email, name: user.name, picture: user.avatar,
       plan: user.plan, credits: user.credits, used, planLimit,
       createdAt: user.created_at,
+      subscription: subscription ? {
+        id: subscription.subscription_id,
+        planType: subscription.plan_type,
+        status: subscription.status,
+        periodEnd: subscription.current_period_end
+      } : null
     },
   }), { headers: J });
+}
+
+// ==================== PayPal API 路由 ====================
+
+async function getPayPalAccessToken(env) {
+  const auth = btoa(`${env.PAYPAL_CLIENT_ID}:${env.PAYPAL_CLIENT_SECRET}`);
+  const res = await fetch(`${env.PAYPAL_API_URL || PAYPAL_CONFIG.apiUrl}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    console.error('PayPal token error:', err);
+    throw new Error('Failed to get PayPal access token');
+  }
+  const data = await res.json();
+  return data.access_token;
+}
+
+async function handlePayPalCreateOrder(request, env) {
+  const J = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+  const user = await getUserFromToken(request, env);
+  if (!user) return new Response(JSON.stringify({ error: '请先登录' }), { status: 401, headers: J });
+
+  try {
+    const { planType } = await request.json();
+    if (!planType || !PAYPAL_CONFIG.plans[planType]) {
+      return new Response(JSON.stringify({ error: '无效的套餐类型' }), { status: 400, headers: J });
+    }
+
+    const plan = PAYPAL_CONFIG.plans[planType];
+    const accessToken = await getPayPalAccessToken(env);
+
+    // 创建 PayPal Order
+    const orderRes = await fetch(`${env.PAYPAL_API_URL || PAYPAL_CONFIG.apiUrl}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation'
+      },
+      body: JSON.stringify({
+        intent: 'CAPTURE',
+        purchase_units: [{
+          amount: {
+            currency_code: plan.currency,
+            value: plan.amount
+          },
+          description: plan.name,
+          custom_id: `user_${user.id}_plan_${planType}`
+        }],
+        application_context: {
+          brand_name: 'Image Background Remover',
+          landing_page: 'LOGIN',
+          user_action: 'PAY_NOW',
+          return_url: `${env.SITE_URL}/payment/success`,
+          cancel_url: `${env.SITE_URL}/payment/cancel`
+        }
+      })
+    });
+
+    if (!orderRes.ok) {
+      const err = await orderRes.text();
+      console.error('PayPal create order error:', err);
+      return new Response(JSON.stringify({ error: '创建订单失败' }), { status: 500, headers: J });
+    }
+
+    const orderData = await orderRes.json();
+
+    // 保存订单到数据库
+    await env.DB.prepare(
+      'INSERT INTO orders (user_id, order_id, plan_type, amount, currency, status) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(user.id, orderData.id, planType, parseFloat(plan.amount), plan.currency, 'CREATED').run();
+
+    return new Response(JSON.stringify({
+      orderId: orderData.id,
+      approvalUrl: orderData.links?.find(l => l.rel === 'approve')?.href || ''
+    }), { headers: J });
+  } catch (err) {
+    console.error('Create order error:', err);
+    return new Response(JSON.stringify({ error: '服务器错误' }), { status: 500, headers: J });
+  }
+}
+
+async function handlePayPalCaptureOrder(request, env) {
+  const J = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+  const user = await getUserFromToken(request, env);
+  if (!user) return new Response(JSON.stringify({ error: '请先登录' }), { status: 401, headers: J });
+
+  try {
+    const { orderId } = await request.json();
+    if (!orderId) {
+      return new Response(JSON.stringify({ error: '缺少订单 ID' }), { status: 400, headers: J });
+    }
+
+    const accessToken = await getPayPalAccessToken(env);
+
+    // 捕获订单
+    const captureRes = await fetch(`${env.PAYPAL_API_URL || PAYPAL_CONFIG.apiUrl}/v2/checkout/orders/${orderId}/capture`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!captureRes.ok) {
+      const err = await captureRes.text();
+      console.error('PayPal capture error:', err);
+      return new Response(JSON.stringify({ error: '支付失败' }), { status: 500, headers: J });
+    }
+
+    const captureData = await captureRes.json();
+
+    // 更新订单状态
+    await env.DB.prepare(
+      'UPDATE orders SET status = ?, paid_at = ?, updated_at = datetime(\'now\') WHERE order_id = ?'
+    ).bind('COMPLETED', new Date().toISOString(), orderId).run();
+
+    // 获取订单信息
+    const order = await env.DB.prepare(
+      'SELECT * FROM orders WHERE order_id = ?'
+    ).bind(orderId).first();
+
+    if (order) {
+      // 更新用户套餐
+      const planCredits = order.plan_type === 'pro' ? 50 : 200;
+      const currentMonth = new Date().toISOString().slice(0, 7);
+      
+      await env.DB.prepare(
+        'UPDATE users SET plan = ?, credits = ?, monthly_credits = ?, credits_month = ?, plan_period = ?, updated_at = datetime(\'now\') WHERE id = ?'
+      ).bind(order.plan_type, planCredits, planCredits, currentMonth, 'monthly', user.id).run();
+
+      // 记录支付
+      const captureId = captureData.purchase_units?.[0]?.payments?.captures?.[0]?.id;
+      if (captureId) {
+        await env.DB.prepare(
+          'INSERT INTO payments (user_id, payment_id, amount, currency, status) VALUES (?, ?, ?, ?, ?)'
+        ).bind(user.id, captureId, parseFloat(order.amount), order.currency, 'COMPLETED').run();
+      }
+    }
+
+    return new Response(JSON.stringify({ success: true, planType: order?.plan_type }), { headers: J });
+  } catch (err) {
+    console.error('Capture order error:', err);
+    return new Response(JSON.stringify({ error: '服务器错误' }), { status: 500, headers: J });
+  }
+}
+
+async function handlePayPalCreateSubscription(request, env) {
+  const J = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+  const user = await getUserFromToken(request, env);
+  if (!user) return new Response(JSON.stringify({ error: '请先登录' }), { status: 401, headers: J });
+
+  try {
+    const { planType } = await request.json();
+    if (!planType || !PAYPAL_CONFIG.plans[planType]) {
+      return new Response(JSON.stringify({ error: '无效的套餐类型' }), { status: 400, headers: J });
+    }
+
+    const plan = PAYPAL_CONFIG.plans[planType];
+    const accessToken = await getPayPalAccessToken(env);
+
+    // 创建订阅（简化版：使用 Order + 订阅管理）
+    // 注：完整的订阅需要先在 PayPal 创建 Product 和 Plan
+    // 这里使用简化方案：用户手动续订
+    
+    const orderRes = await fetch(`${env.PAYPAL_API_URL || PAYPAL_CONFIG.apiUrl}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation'
+      },
+      body: JSON.stringify({
+        intent: 'CAPTURE',
+        purchase_units: [{
+          amount: {
+            currency_code: plan.currency,
+            value: plan.amount
+          },
+          description: `${plan.name} - 月度订阅`,
+          custom_id: `user_${user.id}_plan_${planType}`
+        }],
+        application_context: {
+          brand_name: 'Image Background Remover',
+          landing_page: 'LOGIN',
+          user_action: 'SUBSCRIBE',
+          return_url: `${env.SITE_URL}/payment/success`,
+          cancel_url: `${env.SITE_URL}/payment/cancel`
+        }
+      })
+    });
+
+    if (!orderRes.ok) {
+      const err = await orderRes.text();
+      console.error('PayPal subscription error:', err);
+      return new Response(JSON.stringify({ error: '创建订阅失败' }), { status: 500, headers: J });
+    }
+
+    const orderData = await orderRes.json();
+
+    return new Response(JSON.stringify({
+      orderId: orderData.id,
+      approvalUrl: orderData.links?.find(l => l.rel === 'approve')?.href || ''
+    }), { headers: J });
+  } catch (err) {
+    console.error('Create subscription error:', err);
+    return new Response(JSON.stringify({ error: '服务器错误' }), { status: 500, headers: J });
+  }
+}
+
+async function handlePaymentSuccess(request, env) {
+  const url = new URL(request.url);
+  const token = url.searchParams.get('token');
+  
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>支付成功 - Image Background Remover</title>
+    <script src="https://cdn.tailwindcss.com"><\/script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="min-h-screen bg-gradient-to-br from-green-50 to-blue-50 flex items-center justify-center">
+    <div class="bg-white rounded-2xl shadow-xl p-12 text-center max-w-md mx-4">
+        <div class="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-6">
+            <i class="fas fa-check text-green-600 text-4xl"></i>
+        </div>
+        <h1 class="text-3xl font-bold text-gray-900 mb-4">支付成功！</h1>
+        <p class="text-gray-600 mb-8">感谢您的订阅，套餐已立即生效。</p>
+        <div class="space-y-3">
+            <a href="/" class="block w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium transition-colors">返回首页</a>
+            <a href="/profile" class="block w-full bg-gray-100 hover:bg-gray-200 text-gray-700 py-3 rounded-lg font-medium transition-colors">查看个人中心</a>
+        </div>
+    </div>
+    <script>
+        // 自动刷新用户状态
+        fetch('/auth/me').then(() => {});
+    <\/script>
+</body>
+</html>`;
+
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+async function handlePaymentCancel(request, env) {
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>支付取消 - Image Background Remover</title>
+    <script src="https://cdn.tailwindcss.com"><\/script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="min-h-screen bg-gradient-to-br from-gray-50 to-red-50 flex items-center justify-center">
+    <div class="bg-white rounded-2xl shadow-xl p-12 text-center max-w-md mx-4">
+        <div class="w-20 h-20 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-6">
+            <i class="fas fa-times text-gray-400 text-4xl"></i>
+        </div>
+        <h1 class="text-3xl font-bold text-gray-900 mb-4">支付已取消</h1>
+        <p class="text-gray-600 mb-8">您取消了支付流程，如需继续请重新开始。</p>
+        <div class="space-y-3">
+            <a href="/pricing" class="block w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium transition-colors">返回定价页</a>
+            <a href="/" class="block w-full bg-gray-100 hover:bg-gray-200 text-gray-700 py-3 rounded-lg font-medium transition-colors">返回首页</a>
+        </div>
+    </div>
+</body>
+</html>`;
+
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
 // ==================== API 路由 ====================
@@ -538,7 +839,10 @@ const pricingHTML = `<!DOCTYPE html>
                     <li class="flex items-center space-x-3 text-gray-400"><i class="fas fa-times"></i><span>超高清画质</span></li>
                     <li class="flex items-center space-x-3 text-gray-400"><i class="fas fa-times"></i><span>API 访问</span></li>
                 </ul>
-                <a href="/auth/login" class="block w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-center py-3 rounded-lg font-medium transition-all shadow-lg hover:shadow-xl">立即升级</a>
+                <button onclick="handlePayment('pro')" class="pay-btn block w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-center py-3 rounded-lg font-medium transition-all shadow-lg hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed">立即升级</button>
+                <div class="mt-3 text-center">
+                    <img src="https://www.paypalobjects.com/webstatic/mktg/logo/pp_cc_mark_111x69.jpg" alt="PayPal" class="h-8 mx-auto opacity-70">
+                </div>
             </div>
 
             <!-- Premium 套餐 -->
@@ -560,7 +864,10 @@ const pricingHTML = `<!DOCTYPE html>
                     <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">优先处理通道</span></li>
                     <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">API 访问权限</span></li>
                 </ul>
-                <a href="/auth/login" class="block w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-center py-3 rounded-lg font-medium transition-colors">立即升级</a>
+                <button onclick="handlePayment('premium')" class="pay-btn block w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-center py-3 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed">立即升级</button>
+                <div class="mt-3 text-center">
+                    <img src="https://www.paypalobjects.com/webstatic/mktg/logo/pp_cc_mark_111x69.jpg" alt="PayPal" class="h-8 mx-auto opacity-70">
+                </div>
             </div>
         </div>
 
@@ -594,8 +901,71 @@ const pricingHTML = `<!DOCTYPE html>
     <footer class="bg-white border-t mt-12">
         <div class="max-w-6xl mx-auto px-4 py-6 text-center text-gray-500 text-sm">
             <p>© 2026 Image Background Remover. All rights reserved.</p>
+            <p class="mt-2">💳 安全支付由 PayPal 提供支持（沙箱环境）</p>
         </div>
     </footer>
+    <script>
+        let currentUser=null;
+        async function checkAuth(){
+            try{
+                const r=await fetch('/auth/me');
+                const d=await r.json();
+                if(d.authenticated){
+                    currentUser=d.user;
+                    updateButtons();
+                }
+            }catch(e){console.error('Auth check failed:',e)}
+        }
+        function updateButtons(){
+            const btns=document.querySelectorAll('.pay-btn');
+            btns.forEach(btn=>{
+                if(!currentUser){
+                    btn.textContent='登录后购买';
+                    btn.onclick=()=>{window.location.href='/auth/login'};
+                }else{
+                    const planType=btn.parentElement.querySelector('button').dataset?.plan||
+                                   (btn.parentElement.querySelector('.bg-blue-100')?'pro':'premium');
+                    if(currentUser.plan===planType){
+                        btn.textContent='当前套餐';
+                        btn.disabled=true;
+                    }else{
+                        btn.textContent='立即升级';
+                        btn.disabled=false;
+                    }
+                }
+            });
+        }
+        async function handlePayment(planType){
+            if(!currentUser){
+                window.location.href='/auth/login';
+                return;
+            }
+            const btn=document.querySelector(\`.pay-btn[onclick="handlePayment('\${planType}')"]\`);
+            const originalText=btn.textContent;
+            btn.disabled=true;
+            btn.textContent='处理中...';
+            try{
+                const res=await fetch('/api/paypal/create-order',{
+                    method:'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({planType})
+                });
+                const data=await res.json();
+                if(!res.ok) throw new Error(data.error||'创建订单失败');
+                // 跳转到 PayPal 支付页面
+                if(data.approvalUrl){
+                    window.location.href=data.approvalUrl;
+                }else{
+                    throw new Error('未获取到支付链接');
+                }
+            }catch(error){
+                alert('支付失败：'+error.message);
+                btn.disabled=false;
+                btn.textContent=originalText;
+            }
+        }
+        checkAuth();
+    <\/script>
 </body>
 </html>`;
 
@@ -765,6 +1135,15 @@ export default {
     if (url.pathname === '/auth/callback' && request.method === 'GET') return handleAuthCallback(request, env);
     if (url.pathname === '/auth/logout' && request.method === 'GET') return handleAuthLogout(env);
     if (url.pathname === '/auth/me' && request.method === 'GET') return handleAuthMe(request, env);
+
+    // PayPal API
+    if (url.pathname === '/api/paypal/create-order' && request.method === 'POST') return handlePayPalCreateOrder(request, env);
+    if (url.pathname === '/api/paypal/capture-order' && request.method === 'POST') return handlePayPalCaptureOrder(request, env);
+    if (url.pathname === '/api/paypal/create-subscription' && request.method === 'POST') return handlePayPalCreateSubscription(request, env);
+
+    // Payment Pages
+    if (url.pathname === '/payment/success' && request.method === 'GET') return handlePaymentSuccess(request, env);
+    if (url.pathname === '/payment/cancel' && request.method === 'GET') return handlePaymentCancel(request, env);
 
     // API
     if (url.pathname === '/api/remove-bg' && request.method === 'POST') return handleRemoveBg(request, env);
