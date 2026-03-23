@@ -54,19 +54,20 @@ function parseCookies(h) {
 
 // ==================== D1 用户操作 ====================
 
-const PLAN_LIMITS = { free: 5, pro: 50, premium: 999999 };
+const PLAN_LIMITS = { free: 3, pro: 50, premium: 999999 };
 
 async function getOrCreateUser(db, googleUser) {
   // 查找已有用户
   let user = await db.prepare('SELECT * FROM users WHERE google_id = ?').bind(googleUser.id).first();
 
   if (!user) {
-    // 新建用户
+    // 新建用户 - 免费用户注册送 3 次，额度不重置
+    const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
     await db.prepare(
-      'INSERT INTO users (google_id, email, name, avatar, plan, credits, credits_reset_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      'INSERT INTO users (google_id, email, name, avatar, plan, credits, credits_month, plan_period) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     ).bind(
       googleUser.id, googleUser.email, googleUser.name, googleUser.picture,
-      'free', PLAN_LIMITS.free, new Date().toISOString().slice(0, 10)
+      'free', PLAN_LIMITS.free, currentMonth, 'monthly'
     ).run();
     user = await db.prepare('SELECT * FROM users WHERE google_id = ?').bind(googleUser.id).first();
   } else {
@@ -80,14 +81,21 @@ async function getOrCreateUser(db, googleUser) {
 }
 
 async function resetCreditsIfNeeded(db, user) {
-  const today = new Date().toISOString().slice(0, 10);
-  if (user.credits_reset_at !== today) {
+  // 免费用户额度不重置（一次性使用）
+  // Pro/Premium 用户每月重置额度
+  if (user.plan === 'free') {
+    return user;
+  }
+  
+  const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
+  if (user.credits_month !== currentMonth) {
     const limit = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
     await db.prepare(
-      'UPDATE users SET credits = ?, credits_reset_at = ?, updated_at = datetime(\'now\') WHERE id = ?'
-    ).bind(limit, today, user.id).run();
+      'UPDATE users SET credits = ?, monthly_credits = ?, credits_month = ?, monthly_used = 0, updated_at = datetime(\'now\') WHERE id = ?'
+    ).bind(limit, limit, currentMonth, user.id).run();
     user.credits = limit;
-    user.credits_reset_at = today;
+    user.credits_month = currentMonth;
+    user.monthly_used = 0;
   }
   return user;
 }
@@ -212,14 +220,14 @@ async function handleAuthMe(request, env) {
   const user = await getUserFromToken(request, env);
   if (!user) return new Response(JSON.stringify({ authenticated: false }), { headers: J });
 
-  const todayLimit = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
-  const todayUsed = todayLimit - user.credits;
+  const planLimit = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
+  const used = planLimit - user.credits;
 
   return new Response(JSON.stringify({
     authenticated: true,
     user: {
       id: user.id, email: user.email, name: user.name, picture: user.avatar,
-      plan: user.plan, credits: user.credits, todayUsed, todayLimit,
+      plan: user.plan, credits: user.credits, used, planLimit,
       createdAt: user.created_at,
     },
   }), { headers: J });
@@ -237,7 +245,7 @@ async function handleRemoveBg(request, env) {
 
   // 检查额度
   if (user.credits <= 0) {
-    return new Response(JSON.stringify({ error: '今日免费额度已用完，请明天再试', credits: 0 }), { status: 403, headers: J });
+    return new Response(JSON.stringify({ error: '免费额度已用完，请升级套餐后继续使用', credits: 0 }), { status: 403, headers: J });
   }
 
   try {
@@ -252,7 +260,7 @@ async function handleRemoveBg(request, env) {
     // 扣减额度
     const consumed = await consumeCredit(env.DB, user.id);
     if (!consumed) {
-      return new Response(JSON.stringify({ error: '今日免费额度已用完' }), { status: 403, headers: J });
+      return new Response(JSON.stringify({ error: '免费额度已用完，请升级套餐后继续使用' }), { status: 403, headers: J });
     }
 
     // 调用 Remove.bg
@@ -348,6 +356,7 @@ const indexHTML = `<!DOCTYPE html>
                     </div>
                     <div id="userInfo" class="hidden flex items-center space-x-3">
                         <span id="creditsInfo" class="text-xs bg-blue-100 text-blue-700 px-2.5 py-1 rounded-full font-medium"></span>
+                        <a href="/pricing" class="text-xs bg-gradient-to-r from-blue-600 to-indigo-600 text-white px-3 py-1.5 rounded-full font-medium hover:shadow-md transition-all">升级</a>
                         <a href="/profile" title="个人中心">
                             <img id="userAvatar" class="w-9 h-9 rounded-full border-2 border-blue-200 hover:border-blue-400 transition-colors cursor-pointer" alt="avatar">
                         </a>
@@ -421,12 +430,18 @@ const indexHTML = `<!DOCTYPE html>
     <footer class="bg-white border-t mt-12">
         <div class="max-w-6xl mx-auto px-4 py-6 text-center text-gray-500 text-sm">
             <p>⚠️ 免责声明：请勿上传敏感、侵权或违规图片。图片仅在内存中处理，请求结束后自动销毁。</p>
-            <p class="mt-2">Powered by Remove.bg API • Built with ❤️</p>
+            <p class="mt-3 space-x-4">
+                <a href="/pricing" class="hover:text-blue-600 transition-colors">定价方案</a>
+                <span class="text-gray-300">|</span>
+                <a href="/profile" class="hover:text-blue-600 transition-colors">个人中心</a>
+                <span class="text-gray-300">|</span>
+                <span>Powered by Remove.bg API</span>
+            </p>
         </div>
     </footer>
     <script>
         let isAuthenticated=false,currentUser=null;
-        async function checkAuth(){try{const r=await fetch('/auth/me');const d=await r.json();if(d.authenticated){isAuthenticated=true;currentUser=d.user;document.getElementById('loginBtn').classList.add('hidden');document.getElementById('userInfo').classList.remove('hidden');document.getElementById('userAvatar').src=d.user.picture||'';document.getElementById('creditsInfo').textContent='今日剩余 '+d.user.credits+'/'+d.user.todayLimit+' 次'}else{isAuthenticated=false;currentUser=null;document.getElementById('loginBtn').classList.remove('hidden');document.getElementById('userInfo').classList.add('hidden')}}catch(e){isAuthenticated=false;document.getElementById('loginBtn').classList.remove('hidden');document.getElementById('userInfo').classList.add('hidden')}}
+        async function checkAuth(){try{const r=await fetch('/auth/me');const d=await r.json();if(d.authenticated){isAuthenticated=true;currentUser=d.user;document.getElementById('loginBtn').classList.add('hidden');document.getElementById('userInfo').classList.remove('hidden');document.getElementById('userAvatar').src=d.user.picture||'';document.getElementById('creditsInfo').textContent='剩余 '+d.user.credits+'/'+d.user.planLimit+' 次'}else{isAuthenticated=false;currentUser=null;document.getElementById('loginBtn').classList.remove('hidden');document.getElementById('userInfo').classList.add('hidden')}}catch(e){isAuthenticated=false;document.getElementById('loginBtn').classList.remove('hidden');document.getElementById('userInfo').classList.add('hidden')}}
         const urlParams=new URLSearchParams(window.location.search);if(urlParams.get('error')){alert('登录失败: '+urlParams.get('error'));window.history.replaceState({},'','/')}
         checkAuth();
         const uploadArea=document.getElementById('uploadArea'),fileInput=document.getElementById('fileInput'),previewSection=document.getElementById('previewSection'),previewImage=document.getElementById('previewImage'),removeBgBtn=document.getElementById('removeBgBtn'),loadingSection=document.getElementById('loadingSection'),resultSection=document.getElementById('resultSection'),originalImage=document.getElementById('originalImage'),resultImage=document.getElementById('resultImage'),errorSection=document.getElementById('errorSection'),errorMessage=document.getElementById('errorMessage'),retryBtn=document.getElementById('retryBtn'),startOverBtn=document.getElementById('startOverBtn'),downloadPngBtn=document.getElementById('downloadPngBtn'),downloadWithBgBtn=document.getElementById('downloadWithBgBtn'),bgColorBtns=document.querySelectorAll('.bg-color-btn');
@@ -446,6 +461,141 @@ const indexHTML = `<!DOCTYPE html>
         retryBtn.addEventListener('click',()=>{errorSection.classList.add('hidden');previewSection.classList.remove('hidden')});
         function showError(m){errorMessage.textContent=m;errorSection.classList.remove('hidden')}
     <\/script>
+</body>
+</html>`;
+
+// ==================== 定价页面 ====================
+
+const pricingHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>定价方案 - Image Background Remover</title>
+    <script src="https://cdn.tailwindcss.com"><\/script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
+    <header class="bg-white shadow-sm">
+        <div class="max-w-6xl mx-auto px-4 py-6">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-3">
+                    <a href="/" class="text-gray-500 hover:text-gray-700 transition-colors"><i class="fas fa-arrow-left text-lg"></i></a>
+                    <h1 class="text-2xl font-bold text-gray-900">定价方案</h1>
+                </div>
+                <a href="/" class="text-blue-600 hover:text-blue-700 font-medium flex items-center space-x-1"><i class="fas fa-home"></i><span>返回首页</span></a>
+            </div>
+        </div>
+    </header>
+    <main class="max-w-6xl mx-auto px-4 py-12">
+        <!-- 页面标题 -->
+        <div class="text-center mb-12">
+            <h2 class="text-4xl font-bold text-gray-900 mb-4">选择适合您的套餐</h2>
+            <p class="text-lg text-gray-600">灵活定价，满足不同类型用户需求</p>
+        </div>
+
+        <!-- 定价卡片 -->
+        <div class="grid md:grid-cols-3 gap-8 mb-12">
+            <!-- Free 套餐 -->
+            <div class="bg-white rounded-2xl shadow-xl p-8 border-2 border-gray-200 hover:border-blue-300 transition-all">
+                <div class="text-center mb-6">
+                    <div class="inline-block bg-gray-100 text-gray-700 px-4 py-1 rounded-full text-sm font-semibold mb-4">🆓 Free</div>
+                    <h3 class="text-3xl font-bold text-gray-900 mb-2">免费</h3>
+                    <p class="text-gray-500">适合偶尔使用的用户</p>
+                </div>
+                <div class="text-center mb-6">
+                    <span class="text-5xl font-bold text-gray-900">¥0</span>
+                    <span class="text-gray-500">/永久</span>
+                </div>
+                <ul class="space-y-4 mb-8">
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">3 次免费额度</span></li>
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">标准画质输出</span></li>
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">基础背景色切换</span></li>
+                    <li class="flex items-center space-x-3 text-gray-400"><i class="fas fa-times"></i><span>批量处理</span></li>
+                    <li class="flex items-center space-x-3 text-gray-400"><i class="fas fa-times"></i><span>高清画质输出</span></li>
+                    <li class="flex items-center space-x-3 text-gray-400"><i class="fas fa-times"></i><span>优先处理</span></li>
+                </ul>
+                <a href="/auth/login" class="block w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-center py-3 rounded-lg font-medium transition-colors">免费注册</a>
+            </div>
+
+            <!-- Pro 套餐 -->
+            <div class="bg-white rounded-2xl shadow-xl p-8 border-2 border-blue-500 relative transform scale-105">
+                <div class="absolute top-0 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-gradient-to-r from-blue-500 to-indigo-500 text-white px-6 py-2 rounded-full text-sm font-bold shadow-lg">最受欢迎</div>
+                <div class="text-center mb-6">
+                    <div class="inline-block bg-blue-100 text-blue-700 px-4 py-1 rounded-full text-sm font-semibold mb-4">⭐ Pro</div>
+                    <h3 class="text-3xl font-bold text-gray-900 mb-2">专业版</h3>
+                    <p class="text-gray-500">适合创作者和小微企业</p>
+                </div>
+                <div class="text-center mb-6">
+                    <span class="text-5xl font-bold text-gray-900">¥29.9</span>
+                    <span class="text-gray-500">/月</span>
+                </div>
+                <ul class="space-y-4 mb-8">
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">50 次额度/月</span></li>
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">高清画质输出</span></li>
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">全部背景色选项</span></li>
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">批量处理（最多 10 张）</span></li>
+                    <li class="flex items-center space-x-3 text-gray-400"><i class="fas fa-times"></i><span>超高清画质</span></li>
+                    <li class="flex items-center space-x-3 text-gray-400"><i class="fas fa-times"></i><span>API 访问</span></li>
+                </ul>
+                <a href="/auth/login" class="block w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-center py-3 rounded-lg font-medium transition-all shadow-lg hover:shadow-xl">立即升级</a>
+            </div>
+
+            <!-- Premium 套餐 -->
+            <div class="bg-white rounded-2xl shadow-xl p-8 border-2 border-gray-200 hover:border-purple-300 transition-all">
+                <div class="text-center mb-6">
+                    <div class="inline-block bg-purple-100 text-purple-700 px-4 py-1 rounded-full text-sm font-semibold mb-4">💎 Premium</div>
+                    <h3 class="text-3xl font-bold text-gray-900 mb-2">高级版</h3>
+                    <p class="text-gray-500">适合高频用户和企业</p>
+                </div>
+                <div class="text-center mb-6">
+                    <span class="text-5xl font-bold text-gray-900">¥59.9</span>
+                    <span class="text-gray-500">/月</span>
+                </div>
+                <ul class="space-y-4 mb-8">
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">200 次额度/月</span></li>
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">超高清画质输出</span></li>
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">自定义背景图</span></li>
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">批量处理（最多 50 张）</span></li>
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">优先处理通道</span></li>
+                    <li class="flex items-center space-x-3"><i class="fas fa-check text-green-500"></i><span class="text-gray-700">API 访问权限</span></li>
+                </ul>
+                <a href="/auth/login" class="block w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-center py-3 rounded-lg font-medium transition-colors">立即升级</a>
+            </div>
+        </div>
+
+        <!-- 常见问题 -->
+        <div class="bg-white rounded-2xl shadow-xl p-8">
+            <h3 class="text-2xl font-bold text-gray-900 mb-6 text-center">常见问题</h3>
+            <div class="space-y-4">
+                <div class="border-b border-gray-200 pb-4">
+                    <h4 class="font-semibold text-gray-900 mb-2"><i class="fas fa-question-circle text-blue-500 mr-2"></i>免费额度的 3 次用完后怎么办？</h4>
+                    <p class="text-gray-600">免费额度为注册赠送，一次性使用。用完后您可以选择升级到 Pro 或 Premium 套餐继续使用，或者使用新账号注册获得额外 3 次免费额度。</p>
+                </div>
+                <div class="border-b border-gray-200 pb-4">
+                    <h4 class="font-semibold text-gray-900 mb-2"><i class="fas fa-question-circle text-blue-500 mr-2"></i>套餐额度会累积吗？</h4>
+                    <p class="text-gray-600">不会。Pro 和 Premium 套餐的月度额度会在每个计费周期开始时重置，未使用的额度不会累积到下一周期。</p>
+                </div>
+                <div class="border-b border-gray-200 pb-4">
+                    <h4 class="font-semibold text-gray-900 mb-2"><i class="fas fa-question-circle text-blue-500 mr-2"></i>如何升级或降级套餐？</h4>
+                    <p class="text-gray-600">登录后可在个人中心页面进行套餐升级或降级。升级立即生效，降级将在下个计费周期生效。</p>
+                </div>
+                <div class="border-b border-gray-200 pb-4">
+                    <h4 class="font-semibold text-gray-900 mb-2"><i class="fas fa-question-circle text-blue-500 mr-2"></i>支持退款吗？</h4>
+                    <p class="text-gray-600">如购买后 7 天内未使用任何额度，可申请全额退款。超过 7 天或有使用记录则不支持退款。</p>
+                </div>
+                <div>
+                    <h4 class="font-semibold text-gray-900 mb-2"><i class="fas fa-question-circle text-blue-500 mr-2"></i>支持哪些支付方式？</h4>
+                    <p class="text-gray-600">目前支持微信支付、支付宝和银联卡支付。更多支付方式正在接入中。</p>
+                </div>
+            </div>
+        </div>
+    </main>
+    <footer class="bg-white border-t mt-12">
+        <div class="max-w-6xl mx-auto px-4 py-6 text-center text-gray-500 text-sm">
+            <p>© 2026 Image Background Remover. All rights reserved.</p>
+        </div>
+    </footer>
 </body>
 </html>`;
 
@@ -498,13 +648,16 @@ const profileHTML = `<!DOCTYPE html>
                             <span id="pCreatedAt" class="text-xs text-gray-400"></span>
                         </div>
                     </div>
-                    <a href="/auth/logout" class="text-sm text-gray-400 hover:text-red-600 transition-colors flex items-center space-x-1 self-start"><i class="fas fa-sign-out-alt"></i><span>退出</span></a>
+                    <div class="flex flex-col items-end space-y-2">
+                        <a href="/pricing" id="upgradeBtn" class="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white px-4 py-2 rounded-lg font-medium transition-all shadow-md hover:shadow-lg text-sm">升级套餐</a>
+                        <a href="/auth/logout" class="text-sm text-gray-400 hover:text-red-600 transition-colors flex items-center space-x-1"><i class="fas fa-sign-out-alt"></i><span>退出</span></a>
+                    </div>
                 </div>
             </div>
 
             <!-- 使用额度 -->
             <div class="bg-white rounded-2xl shadow-xl p-8">
-                <h3 class="text-lg font-bold text-gray-900 mb-4 flex items-center space-x-2"><i class="fas fa-chart-bar text-blue-600"></i><span>今日使用额度</span></h3>
+                <h3 class="text-lg font-bold text-gray-900 mb-4 flex items-center space-x-2"><i class="fas fa-chart-bar text-blue-600"></i><span>当前套餐额度</span></h3>
                 <div class="flex items-center justify-between mb-3">
                     <span class="text-gray-600">已使用 <span id="pUsed" class="font-bold text-gray-900"></span> / <span id="pTotal" class="font-bold text-gray-900"></span> 次</span>
                     <span id="pPercent" class="text-sm font-medium text-blue-600"></span>
@@ -512,7 +665,7 @@ const profileHTML = `<!DOCTYPE html>
                 <div class="w-full bg-gray-200 rounded-full h-3">
                     <div id="pBar" class="h-3 rounded-full transition-all duration-500" style="width:0%"></div>
                 </div>
-                <p class="text-sm text-gray-400 mt-3"><i class="fas fa-clock mr-1"></i>额度将于明日 00:00 (UTC) 自动重置</p>
+                <p id="pResetTip" class="text-sm text-gray-400 mt-3"><i class="fas fa-info-circle mr-1"></i>免费套餐额度一次性使用，用完即止</p>
             </div>
 
             <!-- 使用记录 -->
@@ -544,14 +697,23 @@ const profileHTML = `<!DOCTYPE html>
                 document.getElementById('pAvatar').src=u.picture||'';
                 document.getElementById('pName').textContent=u.name||'用户';
                 document.getElementById('pEmail').textContent=u.email;
-                document.getElementById('pPlan').textContent=u.plan==='free'?'🆓 Free':u.plan==='pro'?'⭐ Pro':'💎 Premium';
+                const planText=u.plan==='free'?'🆓 Free':u.plan==='pro'?'⭐ Pro':'💎 Premium';
+                document.getElementById('pPlan').textContent=planText;
                 document.getElementById('pCreatedAt').textContent='注册于 '+new Date(u.createdAt).toLocaleDateString('zh-CN');
-                const used=u.todayUsed,total=u.todayLimit,pct=total>0?Math.round(used/total*100):0;
+                // 根据套餐显示不同的升级按钮
+                const upgradeBtn=document.getElementById('upgradeBtn');
+                if(u.plan==='free'){upgradeBtn.textContent='升级套餐';upgradeBtn.href='/pricing';}
+                else{upgradeBtn.textContent='管理订阅';upgradeBtn.href='/pricing';}
+                const used=u.used,total=u.planLimit,pct=total>0?Math.round(used/total*100):0;
                 document.getElementById('pUsed').textContent=used;
                 document.getElementById('pTotal').textContent=total;
                 document.getElementById('pPercent').textContent=pct+'%';
                 const bar=document.getElementById('pBar');bar.style.width=pct+'%';
                 bar.className='h-3 rounded-full transition-all duration-500 '+(pct>=90?'bg-red-500':pct>=60?'bg-yellow-500':'bg-blue-500');
+                // 根据套餐显示不同提示
+                const resetTip=document.getElementById('pResetTip');
+                if(u.plan==='free'){resetTip.innerHTML='<i class="fas fa-info-circle mr-1"></i>免费套餐额度一次性使用，用完即止';}
+                else if(u.plan==='pro'||u.plan==='premium'){resetTip.innerHTML='<i class="fas fa-redo mr-1"></i>额度将于下月同日自动重置';}
                 loadLogs(1);
             }catch(e){document.getElementById('notLoggedIn').classList.remove('hidden')}
         }
@@ -611,6 +773,9 @@ export default {
     // Pages
     if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
       return new Response(indexHTML, { headers: { 'Content-Type': 'text/html; charset=utf-8', ...cors } });
+    }
+    if (request.method === 'GET' && url.pathname === '/pricing') {
+      return new Response(pricingHTML, { headers: { 'Content-Type': 'text/html; charset=utf-8', ...cors } });
     }
     if (request.method === 'GET' && url.pathname === '/profile') {
       return new Response(profileHTML, { headers: { 'Content-Type': 'text/html; charset=utf-8', ...cors } });
